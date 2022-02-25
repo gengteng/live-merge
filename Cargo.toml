@@ -4,16 +4,21 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+log = "0.4"
+env_logger = "0.9"
+bytes = "1.1"
+
 tokio = { version = "1.17.0", features = ["full"]}
 clap = { version = "3.0", features = ["derive"]}
 anyhow = "1.0"
 reqwest = { version = "0.11", features = ["json"] }
-ffmpeg = { package = "ffmpeg-next", version = "5.0.2", features = ["build", "build-lib-x264", "build-license-gpl"] }
-ffmpeg-sys-next = "5.0.1"
-webrtc = "0.4.0"
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
-env_logger = "0.9"
-bytes = "1.1"
-log = "0.4"
+
+webrtc = "0.4.0"
 openh264 = { version = "0.2.12", features = ["asm"]}
+ffmpeg = { package = "ffmpeg-next", version = "5.0.2", features = ["build"] }
+ffmpeg-sys-next = "5.0"
+fdk-aac = "0.4"
+rml_rtmp = "0.6"
+#photon-rs = "0.3"

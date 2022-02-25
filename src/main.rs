@@ -2,19 +2,19 @@ mod api;
 mod ff;
 mod param;
 mod rtc;
+mod rtmp;
 
 use crate::api::PlayParam;
-use crate::ff::build_audio_encoder;
+use crate::rtmp::RtmpConnection;
 use bytes::Bytes;
 use clap::Parser;
-use std::path::PathBuf;
 use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
 #[derive(Debug, Parser)]
 struct Opts {
     #[clap(short = 'o', long)]
-    output: PathBuf,
+    output: String,
 
     #[clap(short = 'h', long)]
     host: String,
@@ -32,18 +32,23 @@ struct Opts {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let Opts {
+        output,
         host,
         port,
         tid,
         log_level,
-        ..
     } = Opts::parse();
 
     ffmpeg::init()?;
 
     env_logger::builder().filter(None, log_level).init();
 
-    build_audio_encoder()?;
+    let mut rtmp_conn = RtmpConnection::connect(&output).await?;
+    log::info!("[rtmp handshaked] addr: {}", output,);
+
+    rtmp_conn.publish("gengteng").await?;
+
+    std::future::pending::<()>().await;
 
     let (sender, receiver) = tokio::sync::mpsc::channel::<Bytes>(32);
 
@@ -52,8 +57,6 @@ async fn main() -> anyhow::Result<()> {
             log::error!("ff::decode error: {}", e);
         }
     });
-
-    // Err(anyhow::anyhow!("return"))?;
 
     let pc = rtc::init(sender).await?;
     let offer = pc.create_offer(None).await?;

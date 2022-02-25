@@ -1,11 +1,11 @@
+use bytes::Bytes;
 use ffmpeg::filter::Graph;
 use ffmpeg::{Filter, Frame, Rational};
 use ffmpeg_sys_next::*;
-use serde::{Deserialize, Serialize};
-
-use bytes::Bytes;
-use ffmpeg::codec::Id;
 use openh264::formats::YUVSource;
+// use photon_rs::native::save_image;
+// use photon_rs::PhotonImage;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::Receiver;
 
 const INPUT_FORMAT: AVPixelFormat = AVPixelFormat::AV_PIX_FMT_YUV420P;
@@ -35,6 +35,17 @@ pub fn decode(mut receiver: Receiver<Bytes>) -> anyhow::Result<()> {
             yuv.v().len(),
             yuv.y().len() + yuv.u().len() + yuv.v().len()
         );
+
+        if yuv.width() == 0 {
+            continue;
+        }
+
+        // let len = (yuv.width() * yuv.height() * 4) as usize;
+        // let mut vec = vec![0u8; len];
+        // yuv.write_rgba8(&mut vec)?;
+        //
+        // let image = PhotonImage::new(vec, yuv.width() as u32, yuv.height() as u32);
+
         count += 1;
 
         let pts = if start == 0 {
@@ -158,16 +169,6 @@ pub fn build_filter_chain(config: &FilterConfig) -> anyhow::Result<Graph> {
 
 pub fn find_filter(name: &str) -> anyhow::Result<Filter> {
     ffmpeg::filter::find(name).ok_or_else(|| anyhow::anyhow!("Filter '{}' not found", name))
-}
-
-pub fn build_audio_encoder() -> anyhow::Result<()> {
-    let aac = ffmpeg::codec::encoder::find(Id::AAC)
-        .ok_or_else(|| anyhow::anyhow!("Id::AAC not found"))?;
-    log::info!("find by id: {}", aac.name());
-    let aac = ffmpeg::codec::encoder::find_by_name("libfdk_aac")
-        .ok_or_else(|| anyhow::anyhow!("Codec 'libfdk_aac' not found"))?;
-    log::info!("find by name: {}", aac.name());
-    Ok(())
 }
 
 mod rational_serde {

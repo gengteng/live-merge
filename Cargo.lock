@@ -750,6 +750,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "fdk-aac"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a8f295617a979ab0bdceab08e16f3edb82ae876b48c25354fa56fed4d276b0db"
+dependencies = [
+ "fdk-aac-sys",
+]
+
+[[package]]
+name = "fdk-aac-sys"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ccdef9ea77a8aa82f37b62ef0d847356e15f1f12b9f894b5ca7e8de048e17fc"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "ff"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1207,11 +1225,13 @@ dependencies = [
  "bytes",
  "clap",
  "env_logger",
+ "fdk-aac",
  "ffmpeg-next",
  "ffmpeg-sys-next",
  "log",
  "openh264",
  "reqwest",
+ "rml_rtmp",
  "serde",
  "serde_json",
  "tokio",
@@ -1856,6 +1876,31 @@ dependencies = [
  "untrusted",
  "web-sys",
  "winapi",
+]
+
+[[package]]
+name = "rml_amf0"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63551cfcd4d1f42733c190e4b58dd268b1eacb73410d9afbf62784aa12cac240"
+dependencies = [
+ "byteorder",
+ "thiserror",
+]
+
+[[package]]
+name = "rml_rtmp"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "abef8d3fe89ae557161ec5351064a479524c0c31d1980f0710623625c10a04e3"
+dependencies = [
+ "byteorder",
+ "bytes",
+ "hmac 0.10.1",
+ "rand",
+ "rml_amf0",
+ "sha2 0.9.9",
+ "thiserror",
 ]
 
 [[package]]
