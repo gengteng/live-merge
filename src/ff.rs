@@ -1,17 +1,23 @@
-use bytes::Bytes;
 use ffmpeg::filter::Graph;
 use ffmpeg::{Filter, Frame, Rational};
 use ffmpeg_sys_next::*;
+use openh264::encoder::EncoderConfig;
 use openh264::formats::YUVSource;
 // use photon_rs::native::save_image;
 // use photon_rs::PhotonImage;
+use crate::h264::H264Data;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::Receiver;
+use tokio::sync::mpsc::{Receiver, UnboundedSender};
 
 const INPUT_FORMAT: AVPixelFormat = AVPixelFormat::AV_PIX_FMT_YUV420P;
 
-pub fn decode(mut receiver: Receiver<Bytes>) -> anyhow::Result<()> {
+pub fn decode(
+    mut receiver: Receiver<H264Data>,
+    h264_sender: UnboundedSender<H264Data>,
+) -> anyhow::Result<()> {
     let mut decoder = openh264::decoder::Decoder::new()?;
+
+    let mut encoder = openh264::encoder::Encoder::with_config(EncoderConfig::new(320, 240))?;
 
     let config = FilterConfig::default();
     let mut graph = build_filter_chain(&config)?;
@@ -24,7 +30,7 @@ pub fn decode(mut receiver: Receiver<Bytes>) -> anyhow::Result<()> {
     // 138240
     let mut count = 0;
     while let Some(packet) = receiver.blocking_recv() {
-        let yuv = decoder.decode(packet.as_ref())?;
+        let yuv = decoder.decode(packet.data().as_ref())?;
         log::info!(
             "{count}) width: {}, height: {}, strides: {:?}, y: {}, u: {}, v: {}, yuv: {}",
             yuv.width(),
@@ -68,6 +74,23 @@ pub fn decode(mut receiver: Receiver<Bytes>) -> anyhow::Result<()> {
             .sink()
             .frame(&mut frame)?;
         log::info!("[filtered frame] pts: {:?}", frame.pts());
+
+        let h264 = encoder.encode(&yuv)?;
+        let mut vec = Vec::with_capacity(1024);
+        h264.write_vec(&mut vec);
+        println!(
+            "h264 frame type: {:?}, {} bytes: {:0x?}",
+            h264.frame_type(),
+            vec.len(),
+            vec
+        );
+        if h264_sender
+            .send(H264Data::new(packet.timestamp(), vec.into()))
+            .is_err()
+        {
+            log::error!("Rtmp client closed");
+            break;
+        }
     }
 
     Ok(())

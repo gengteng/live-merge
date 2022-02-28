@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 
-use bytes::{Bytes, BytesMut};
-use std::io::{Seek, SeekFrom, Write};
+use crate::H264Data;
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 use webrtc::api::interceptor_registry::register_default_interceptors;
@@ -22,38 +21,7 @@ use webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirecti
 use webrtc::rtp_transceiver::RTCRtpTransceiverInit;
 use webrtc::track::track_remote::TrackRemote;
 
-pub struct H264Sink {
-    sender: Sender<Bytes>,
-}
-
-impl H264Sink {
-    pub fn new(sender: Sender<Bytes>) -> Self {
-        Self { sender }
-    }
-}
-
-impl Write for H264Sink {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let len = buf.len();
-        log::info!("[H264Sink::write] send {} bytes", buf.len());
-        match self.sender.blocking_send(BytesMut::from(buf).freeze()) {
-            Ok(_) => Ok(len),
-            Err(_) => Err(std::io::ErrorKind::Other.into()),
-        }
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl Seek for H264Sink {
-    fn seek(&mut self, _pos: SeekFrom) -> std::io::Result<u64> {
-        Ok(0)
-    }
-}
-
-pub async fn init(sender: Sender<Bytes>) -> anyhow::Result<Arc<RTCPeerConnection>> {
+pub async fn init(sender: Sender<H264Data>) -> anyhow::Result<Arc<RTCPeerConnection>> {
     let mut me = MediaEngine::default();
     me.register_codec(
         RTCRtpCodecParameters {
@@ -126,18 +94,18 @@ pub async fn init(sender: Sender<Bytes>) -> anyhow::Result<Arc<RTCPeerConnection
                 let pc = pc.clone();
                 Box::pin(async move {
                     if let Some(track) = track {
-                        log::info!(
-                            "[on_track] ssrc: {}, payload_type: {}",
-                            track.ssrc(),
-                            track.payload_type()
-                        );
                         let s = s.clone();
                         let pc = pc.clone();
                         tokio::spawn(async move {
                             let codec = track.codec().await;
                             let mime_type = codec.capability.mime_type;
+                            let clock_rate = codec.capability.clock_rate;
                             let ssrc = track.ssrc();
-                            log::info!("clock rate: {}", codec.capability.clock_rate);
+                            log::info!(
+                                "[on_track] ssrc: {}, payload_type: {}",
+                                track.ssrc(),
+                                track.payload_type()
+                            );
                             if mime_type.starts_with("video") {
                                 tokio::spawn(async move {
                                     match pc.upgrade() {
@@ -164,7 +132,6 @@ pub async fn init(sender: Sender<Bytes>) -> anyhow::Result<Arc<RTCPeerConnection
                                 let mut rtp_decoder = H264Packet::default();
                                 let mut has_key_frame = false;
                                 while let Ok((packet, attr)) = track.read_rtp().await {
-                                    // TODO: timestamp
                                     log::info!(
                                         "header: {:?}, attributes: {:?}",
                                         packet.header,
@@ -187,7 +154,11 @@ pub async fn init(sender: Sender<Bytes>) -> anyhow::Result<Arc<RTCPeerConnection
                                     match rtp_decoder.depacketize(&packet.payload) {
                                         Ok(h264_pkt) => {
                                             if !h264_pkt.is_empty() {
-                                                if let Err(_) = s.send(h264_pkt).await {
+                                                let timestamp =
+                                                    packet.header.timestamp / clock_rate;
+                                                if let Err(_) =
+                                                    s.send(H264Data::new(timestamp, h264_pkt)).await
+                                                {
                                                     log::error!(
                                                         "Failed to send h264 packet to ffmpeg"
                                                     );

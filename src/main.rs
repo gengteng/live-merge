@@ -1,13 +1,15 @@
 mod api;
 mod ff;
+mod h264;
 mod param;
 mod rtc;
 mod rtmp;
 
 use crate::api::PlayParam;
+use crate::h264::H264Data;
 use crate::rtmp::RtmpConnection;
-use bytes::Bytes;
 use clap::Parser;
+use tokio::sync::mpsc::unbounded_channel;
 use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
@@ -43,17 +45,29 @@ async fn main() -> anyhow::Result<()> {
 
     env_logger::builder().filter(None, log_level).init();
 
-    let mut rtmp_conn = RtmpConnection::connect(&output).await?;
-    log::info!("[rtmp handshaked] addr: {}", output,);
+    let (h264_sender, h264_receiver) = unbounded_channel();
 
-    rtmp_conn.publish("gengteng").await?;
+    tokio::spawn(async move {
+        if let Err(e) = async move {
+            let mut rtmp_conn = RtmpConnection::connect(&output, h264_receiver).await?;
+            log::info!("[rtmp handshaked] addr: {}", output,);
 
-    std::future::pending::<()>().await;
+            rtmp_conn.publish("gengteng").await?;
 
-    let (sender, receiver) = tokio::sync::mpsc::channel::<Bytes>(32);
+            tokio::signal::ctrl_c().await?;
+
+            Ok::<_, anyhow::Error>(())
+        }
+        .await
+        {
+            log::error!("Rtmp client error: {}", e);
+        }
+    });
+
+    let (sender, receiver) = tokio::sync::mpsc::channel::<H264Data>(32);
 
     tokio::task::spawn_blocking(move || {
-        if let Err(e) = ff::decode(receiver) {
+        if let Err(e) = ff::decode(receiver, h264_sender) {
             log::error!("ff::decode error: {}", e);
         }
     });
@@ -81,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
     let mut gather_complete = pc.gathering_complete_promise().await;
     let _ = gather_complete.recv().await;
 
-    std::future::pending::<()>().await;
+    tokio::signal::ctrl_c().await?;
 
     Ok(())
 }

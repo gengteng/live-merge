@@ -1,5 +1,5 @@
+use crate::h264::H264Data;
 use anyhow::bail;
-use bytes::Bytes;
 use rml_rtmp::handshake::{HandshakeProcessResult, PeerType};
 use rml_rtmp::sessions::{
     ClientSession, ClientSessionConfig, ClientSessionEvent, ClientSessionResult,
@@ -9,14 +9,17 @@ use rml_rtmp::time::RtmpTimestamp;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, ToSocketAddrs};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 pub struct RtmpConnection {
     sender: UnboundedSender<Command>,
 }
 
 impl RtmpConnection {
-    pub async fn connect<A: ToSocketAddrs>(addr: A) -> anyhow::Result<Self> {
+    pub async fn connect<A: ToSocketAddrs>(
+        addr: A,
+        mut h264_reader: UnboundedReceiver<H264Data>,
+    ) -> anyhow::Result<Self> {
         let mut socket = TcpStream::connect(addr).await?;
 
         let mut handshake = rml_rtmp::handshake::Handshake::new(PeerType::Client);
@@ -98,8 +101,23 @@ impl RtmpConnection {
                                             metadata.video_height = Some(240);
                                             metadata.video_codec = Some("7".to_string());
                                             RtmpConnection::send_outbound_packet(&mut socket, session.publish_metadata(&metadata)?).await?;
-                                            RtmpConnection::send_outbound_packet(&mut socket, session.publish_video_data(Bytes::new(), RtmpTimestamp::new(0), true)?).await?;
-                                            RtmpConnection::send_outbound_packet(&mut socket, session.publish_audio_data(Bytes::new(), RtmpTimestamp::new(0), true)?).await?;
+                                            // RtmpConnection::send_outbound_packet(&mut socket, session.publish_video_data(Bytes::new(), RtmpTimestamp::new(0), true)?).await?;
+                                            // RtmpConnection::send_outbound_packet(&mut socket, session.publish_audio_data(Bytes::new(), RtmpTimestamp::new(0), true)?).await?;
+                                            let mut timestamp = RtmpTimestamp::new(0);
+                                            let mut rtp_ts = None;
+                                            while let Some(h264) = h264_reader.recv().await {
+                                                match rtp_ts {
+                                                    Some(ts) => {
+                                                        let offset = h264.timestamp() - ts;
+                                                        timestamp = timestamp + offset;
+                                                        rtp_ts = Some(ts + offset);
+                                                    }
+                                                    None => {
+                                                        rtp_ts = Some(h264.timestamp());
+                                                    }
+                                                }
+                                                RtmpConnection::send_outbound_packet(&mut socket, session.publish_video_data(h264.into(), timestamp, true)?).await?;
+                                            }
                                         }
                                         e => log::info!("event: {:?}", e),
                                     }
