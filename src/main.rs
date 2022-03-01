@@ -1,5 +1,5 @@
 mod api;
-mod ff;
+mod codec;
 mod h264;
 mod param;
 mod rtc;
@@ -10,8 +10,6 @@ use crate::h264::H264Data;
 use crate::rtmp::RtmpConnection;
 use clap::Parser;
 use tokio::sync::mpsc::unbounded_channel;
-use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
-use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
 #[derive(Debug, Parser)]
 struct Opts {
@@ -41,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
         log_level,
     } = Opts::parse();
 
-    ffmpeg::init()?;
+    // ffmpeg::init()?;
 
     env_logger::builder().filter(None, log_level).init();
 
@@ -67,33 +65,12 @@ async fn main() -> anyhow::Result<()> {
     let (sender, receiver) = tokio::sync::mpsc::channel::<H264Data>(32);
 
     tokio::task::spawn_blocking(move || {
-        if let Err(e) = ff::decode(receiver, h264_sender) {
+        if let Err(e) = codec::decode(receiver, h264_sender) {
             log::error!("ff::decode error: {}", e);
         }
     });
 
-    let pc = rtc::init(sender).await?;
-    let offer = pc.create_offer(None).await?;
-    pc.set_local_description(offer.clone()).await?;
-    log::info!("local description:\n {}", offer.sdp);
-
-    let client = api::ApiClient::new(&host, port);
-    let param = PlayParam {
-        api: client.api_url(),
-        client_ip: None,
-        sdp: offer.sdp,
-        stream_url: format!("webrtc://{}/live/{}", host, tid),
-        tid,
-    };
-    let play = client.play(&param).await?;
-    log::info!("remote description:\n {}", play.sdp);
-    let mut answer = RTCSessionDescription::default();
-    answer.sdp_type = RTCSdpType::Answer;
-    answer.sdp = play.sdp;
-    pc.set_remote_description(answer).await?;
-
-    let mut gather_complete = pc.gathering_complete_promise().await;
-    let _ = gather_complete.recv().await;
+    let _pc = rtc::init(sender, host, port, tid).await?;
 
     tokio::signal::ctrl_c().await?;
 

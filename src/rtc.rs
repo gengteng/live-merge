@@ -1,7 +1,10 @@
 #![allow(dead_code)]
 
-use crate::H264Data;
+use crate::api::ApiClient;
+use crate::h264::AVCDecoderConfigurationRecord;
+use crate::{H264Data, PlayParam};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_H264, MIME_TYPE_OPUS};
@@ -9,6 +12,8 @@ use webrtc::api::APIBuilder;
 use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
+use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use webrtc::rtp::codecs::h264::H264Packet;
@@ -21,7 +26,12 @@ use webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirecti
 use webrtc::rtp_transceiver::RTCRtpTransceiverInit;
 use webrtc::track::track_remote::TrackRemote;
 
-pub async fn init(sender: Sender<H264Data>) -> anyhow::Result<Arc<RTCPeerConnection>> {
+pub async fn init(
+    sender: Sender<H264Data>,
+    host: String,
+    port: u16,
+    tid: String,
+) -> anyhow::Result<Arc<RTCPeerConnection>> {
     let mut me = MediaEngine::default();
     me.register_codec(
         RTCRtpCodecParameters {
@@ -108,56 +118,61 @@ pub async fn init(sender: Sender<H264Data>) -> anyhow::Result<Arc<RTCPeerConnect
                             );
                             if mime_type.starts_with("video") {
                                 tokio::spawn(async move {
-                                    match pc.upgrade() {
-                                        None => {
-                                            log::error!("Failed to upgrade weak peer connection");
-                                        }
-                                        Some(pc) => {
-                                            if let Err(e) = pc
-                                                .write_rtcp(&[Box::new(PictureLossIndication {
-                                                    sender_ssrc: 0,
-                                                    media_ssrc: ssrc,
-                                                })])
-                                                .await
-                                            {
+                                    loop {
+                                        match pc.upgrade() {
+                                            None => {
                                                 log::error!(
-                                                    "Send pic loss indication error: {}",
-                                                    e
+                                                    "Failed to upgrade weak peer connection"
                                                 );
                                             }
-                                            log::info!("Send pic los indication");
+                                            Some(pc) => {
+                                                if let Err(e) = pc
+                                                    .write_rtcp(&[Box::new(
+                                                        PictureLossIndication {
+                                                            sender_ssrc: 0,
+                                                            media_ssrc: ssrc,
+                                                        },
+                                                    )])
+                                                    .await
+                                                {
+                                                    log::error!(
+                                                        "Send pic loss indication error: {}",
+                                                        e
+                                                    );
+                                                }
+                                                log::info!("Send pic los indication");
+                                            }
                                         }
+
+                                        tokio::time::sleep(Duration::from_secs(3)).await;
                                     }
                                 });
                                 let mut rtp_decoder = H264Packet::default();
                                 let mut has_key_frame = false;
-                                while let Ok((packet, attr)) = track.read_rtp().await {
-                                    log::info!(
-                                        "header: {:?}, attributes: {:?}",
-                                        packet.header,
-                                        attr
-                                    );
-                                    // log::info!(
-                                    //     "[{}:{}] {} bytes received.",
-                                    //     ssrc,
-                                    //     mime_type,
-                                    //     packet.payload.len()
-                                    // );
+                                while let Ok((packet, _attr)) = track.read_rtp().await {
                                     if !has_key_frame {
                                         has_key_frame = is_key_frame(&packet.payload);
                                         if !has_key_frame {
                                             continue;
                                         }
 
-                                        log::info!("got a key frame");
+                                        log::info!("Got a key frame!");
                                     }
+
+                                    // RTP payload format for h264: https://datatracker.ietf.org/doc/html/rfc6184#page-12
+                                    log::info!(
+                                        "RTP payload({}B): {:02x?}",
+                                        packet.payload.len(),
+                                        packet.payload.as_ref()
+                                    );
                                     match rtp_decoder.depacketize(&packet.payload) {
                                         Ok(h264_pkt) => {
                                             if !h264_pkt.is_empty() {
                                                 let timestamp =
                                                     packet.header.timestamp / clock_rate;
-                                                if let Err(_) =
-                                                    s.send(H264Data::new(timestamp, h264_pkt)).await
+                                                if s.send(H264Data::new(timestamp, h264_pkt))
+                                                    .await
+                                                    .is_err()
                                                 {
                                                     log::error!(
                                                         "Failed to send h264 packet to ffmpeg"
@@ -238,6 +253,45 @@ pub async fn init(sender: Sender<H264Data>) -> anyhow::Result<Arc<RTCPeerConnect
             })
         }))
         .await;
+
+    let offer = peer_connection.create_offer(None).await?;
+    peer_connection.set_local_description(offer.clone()).await?;
+    log::info!("local description:\n {}", offer.sdp);
+
+    let client = ApiClient::new(&host, port);
+    let param = PlayParam {
+        api: client.api_url(),
+        client_ip: None,
+        sdp: offer.sdp,
+        stream_url: format!("webrtc://{}/live/{}", host, tid),
+        tid,
+    };
+    let play = client.play(&param).await?;
+    log::info!("remote description:\n {}", play.sdp);
+
+    const PROFILE_PREFIX: &'static str = "profile-level-id=";
+    let profile_level_id = match play.sdp.find(PROFILE_PREFIX) {
+        None => anyhow::bail!("Failed to get profile-level-id"),
+        Some(index) => {
+            let start = index + PROFILE_PREFIX.len();
+            &play.sdp[start..start + 6]
+        }
+    };
+
+    let profile_indication = u8::from_str_radix(&profile_level_id[..2], 16)?;
+    let level_indication = u8::from_str_radix(&profile_level_id[4..], 16)?;
+
+    let record = AVCDecoderConfigurationRecord::new(profile_indication, level_indication);
+
+    log::info!("AVCDecoderConfigurationRecord: {:0x?}", record);
+
+    let mut answer = RTCSessionDescription::default();
+    answer.sdp_type = RTCSdpType::Answer;
+    answer.sdp = play.sdp;
+    peer_connection.set_remote_description(answer).await?;
+
+    let mut gather_complete = peer_connection.gathering_complete_promise().await;
+    let _ = gather_complete.recv().await;
 
     Ok(peer_connection)
 }
