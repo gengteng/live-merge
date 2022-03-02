@@ -1,28 +1,36 @@
 #![allow(dead_code)]
-use bytes::{BufMut, Bytes};
+use bytes::{BufMut, Bytes, BytesMut};
 
-pub struct H264Data {
-    timestamp: u32,
-    data: Bytes,
+pub enum H264Data {
+    Configuration {
+        raw: Bytes,
+        record: AVCDecoderConfigurationRecord,
+    },
+    Data {
+        timestamp: u32,
+        data: Bytes,
+    },
 }
 
 impl H264Data {
-    pub fn new(timestamp: u32, data: Bytes) -> Self {
-        Self { timestamp, data }
+    pub fn configuration(raw: Bytes, record: AVCDecoderConfigurationRecord) -> Self {
+        Self::Configuration { raw, record }
     }
-
-    pub fn timestamp(&self) -> u32 {
-        self.timestamp
-    }
-
-    pub fn data(&self) -> &Bytes {
-        &self.data
+    pub fn data(timestamp: u32, data: Bytes) -> Self {
+        Self::Data { timestamp, data }
     }
 }
 
 impl From<H264Data> for Bytes {
     fn from(p: H264Data) -> Self {
-        p.data
+        match p {
+            H264Data::Configuration { record, .. } => {
+                let mut buffer = BytesMut::new();
+                record.write_to(&mut buffer);
+                buffer.freeze()
+            }
+            H264Data::Data { data, .. } => data,
+        }
     }
 }
 
@@ -46,7 +54,7 @@ impl From<H264Data> for Bytes {
 // }
 // }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AVCDecoderConfigurationRecord {
     pub configuration_version: u8,
     pub profile_indication: u8,
@@ -69,11 +77,21 @@ impl AVCDecoderConfigurationRecord {
             profile_compatibility: 0,
             level_indication,
             length_size_minus_one: 0b11,
-            num_of_sequence_parameter_sets: 1,
+            num_of_sequence_parameter_sets: 0,
             sequence_parameter_sets: vec![],
-            num_of_picture_parameter_sets: 1,
+            num_of_picture_parameter_sets: 0,
             picture_parameter_sets: vec![],
         }
+    }
+
+    pub fn add_sps(&mut self, data: Vec<u8>) {
+        self.num_of_sequence_parameter_sets += 1;
+        self.sequence_parameter_sets.push((data.len() as u16, data));
+    }
+
+    pub fn add_pps(&mut self, data: Vec<u8>) {
+        self.num_of_picture_parameter_sets += 1;
+        self.picture_parameter_sets.push((data.len() as u16, data))
     }
 
     pub fn write_to<B: BufMut>(&self, mut buffer: B) {

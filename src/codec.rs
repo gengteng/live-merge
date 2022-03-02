@@ -1,4 +1,4 @@
-use bytes::BufMut;
+use bytes::{BufMut, BytesMut};
 // use ffmpeg::filter::Graph;
 // use ffmpeg::{Filter, Frame, Rational};
 // use ffmpeg_sys_next::*;
@@ -43,121 +43,147 @@ pub fn decode(
     // 138240
     let mut count = 0;
     while let Some(packet) = receiver.blocking_recv() {
-        log::info!(
-            "H264 data({}B): {:02x?}",
-            packet.data().len(),
-            packet.data().as_ref()
-        );
-        let yuv = decoder.decode(packet.data().as_ref())?;
-        log::info!(
-            "{count}) width: {}, height: {}, strides: {:?}, y: {}, u: {}, v: {}, yuv: {}",
-            yuv.width(),
-            yuv.height(),
-            yuv.strides_yuv(),
-            yuv.y().len(),
-            yuv.u().len(),
-            yuv.v().len(),
-            yuv.y().len() + yuv.u().len() + yuv.v().len()
-        );
-        count += 1;
-
-        if yuv.width() == 0 {
-            continue;
-        }
-
-        let mut vec = Vec::with_capacity(1024);
-
-        if let State::Created = state {
-            log::info!(
-                "Got video info: width={}, height={}",
-                yuv.width(),
-                yuv.height()
-            );
-            let config = EncoderConfig::new(yuv.width() as u32, yuv.height() as u32);
-            let mut encoder = openh264::encoder::Encoder::with_config(config)?;
-
-            let encoded_frame = encoder.encode(&yuv)?;
-
-            let frame_type = match encoded_frame.frame_type() {
-                FrameType::IDR | FrameType::I => 1,
-                FrameType::P => 2,
-                _ => continue,
-            };
-            vec.put_u8(frame_type << 4 | CODEC_ID);
-            vec.put_i32(0);
-            encoded_frame.write_vec(&mut vec);
-
-            if encoded_frame.frame_type() == FrameType::IDR {
-                for l in 0..encoded_frame.num_layers() {
-                    let layer = encoded_frame.layer(l).unwrap();
-
-                    for n in 0..layer.nal_count() {
-                        let nal = layer.nal_unit(n).unwrap();
-
-                        log::info!("layer: {}, nal: {}, bytes(hex): {:02x?}", l, n, nal);
-                    }
+        match packet {
+            H264Data::Configuration { raw, record } => {
+                let yuv = decoder.decode(raw.as_ref())?;
+                log::info!(
+                    "{count}) width: {}, height: {}, strides: {:?}, y: {}, u: {}, v: {}, yuv: {}",
+                    yuv.width(),
+                    yuv.height(),
+                    yuv.strides_yuv(),
+                    yuv.y().len(),
+                    yuv.u().len(),
+                    yuv.v().len(),
+                    yuv.y().len() + yuv.u().len() + yuv.v().len()
+                );
+                count += 1;
+                let mut buffer = BytesMut::new();
+                buffer.put_u8(0x17);
+                buffer.put_u32(0);
+                record.write_to(&mut buffer);
+                let buffer = buffer.freeze();
+                if h264_sender.send(H264Data::data(0, buffer)).is_err() {
+                    log::error!("Rtmp client closed while sending h264 configuration");
+                    break;
                 }
             }
+            H264Data::Data {
+                data: packet,
+                timestamp,
+            } => {
+                log::info!(
+                    "Depacketized H264 data({}B): {:02x?}",
+                    packet.len(),
+                    packet.as_ref()
+                );
+                let yuv = decoder.decode(packet.as_ref())?;
+                log::info!(
+                    "{count}) width: {}, height: {}, strides: {:?}, y: {}, u: {}, v: {}, yuv: {}",
+                    yuv.width(),
+                    yuv.height(),
+                    yuv.strides_yuv(),
+                    yuv.y().len(),
+                    yuv.u().len(),
+                    yuv.v().len(),
+                    yuv.y().len() + yuv.u().len() + yuv.v().len()
+                );
+                count += 1;
 
-            log::info!("h264 sequence header({}B): {:02x?}", vec.len(), vec);
-            if h264_sender
-                .send(H264Data::new(packet.timestamp(), vec.into()))
-                .is_err()
-            {
-                log::error!("Rtmp client closed");
-                break;
-            }
+                if yuv.width() == 0 {
+                    continue;
+                }
 
-            state = State::HeaderReceived(encoder);
-        } else if let State::HeaderReceived(encoder) = &mut state {
-            let encoded_frame = encoder.encode(&yuv)?;
-            let frame_type = match encoded_frame.frame_type() {
-                FrameType::IDR | FrameType::I => 1,
-                FrameType::P => 2,
-                _ => continue,
-            };
-            let codec_id = 7;
-            let packet_type: u8 = 1;
-            let composition_time: i32 = 0; //if frame_type == 1 { 1 } else { 0 };
-            let end = ((packet_type as i32) << 24) | composition_time;
-            vec.put_u8(frame_type << 4 | codec_id);
-            vec.put_i32(end);
-            encoded_frame.write_vec(&mut vec);
-            log::info!(
-                "h264 frame type: {:?}, {} bytes(hex): {:02x?}",
-                encoded_frame.frame_type(),
-                vec.len(),
-                vec
-            );
-            if h264_sender
-                .send(H264Data::new(packet.timestamp(), vec.into()))
-                .is_err()
-            {
-                log::error!("Rtmp client closed");
-                break;
+                let mut vec = Vec::with_capacity(1024);
+
+                if let State::Created = state {
+                    log::info!(
+                        "Got video info: width={}, height={}",
+                        yuv.width(),
+                        yuv.height()
+                    );
+                    let config = EncoderConfig::new(yuv.width() as u32, yuv.height() as u32);
+                    let mut encoder = openh264::encoder::Encoder::with_config(config)?;
+
+                    let encoded_frame = encoder.encode(&yuv)?;
+
+                    let frame_type = match encoded_frame.frame_type() {
+                        FrameType::IDR | FrameType::I => 1,
+                        FrameType::P => 2,
+                        _ => continue,
+                    };
+                    vec.put_u8(frame_type << 4 | CODEC_ID);
+                    vec.put_slice(&[1, 0, 0, 0]);
+
+                    if encoded_frame.frame_type() == FrameType::IDR {
+                        let layer = encoded_frame.layer(1).unwrap();
+
+                        for n in 0..layer.nal_count() {
+                            let nal = layer.nal_unit(n).unwrap();
+                            vec.put_slice(nal);
+                        }
+                    }
+
+                    log::info!("h264 sequence header({}B): {:02x?}", vec.len(), vec);
+                    if h264_sender
+                        .send(H264Data::data(timestamp, vec.into()))
+                        .is_err()
+                    {
+                        log::error!("Rtmp client closed");
+                        break;
+                    }
+
+                    state = State::HeaderReceived(encoder);
+                } else if let State::HeaderReceived(encoder) = &mut state {
+                    let encoded_frame = encoder.encode(&yuv)?;
+                    let frame_type = match encoded_frame.frame_type() {
+                        FrameType::IDR | FrameType::I => 1,
+                        FrameType::P => 2,
+                        _ => continue,
+                    };
+                    let codec_id = 7;
+                    let packet_type: u8 = 1;
+                    let composition_time: i32 = 0; //if frame_type == 1 { 1 } else { 0 };
+                    let end = ((packet_type as i32) << 24) | composition_time;
+                    vec.put_u8(frame_type << 4 | codec_id);
+                    vec.put_i32(end);
+                    encoded_frame.write_vec(&mut vec);
+                    log::info!(
+                        "h264 frame type: {:?}, {} bytes(hex): {:02x?}",
+                        encoded_frame.frame_type(),
+                        vec.len(),
+                        vec
+                    );
+                    if h264_sender
+                        .send(H264Data::data(timestamp, vec.into()))
+                        .is_err()
+                    {
+                        log::error!("Rtmp client closed while sending h264 data");
+                        break;
+                    }
+                }
+
+                // let pts = if start == 0 {
+                //     start = ffmpeg::util::time::current();
+                //     0
+                // } else {
+                //     ffmpeg::util::time::current() - start
+                // };
+                //
+                // frame.set_pts(Some(pts));
+                // fill_frame(&yuv, &mut frame);
+                // graph
+                //     .get("in")
+                //     .expect("Cannot get filter 'in'")
+                //     .source()
+                //     .add(&frame)?;
+                // graph
+                //     .get("out")
+                //     .expect("Cannot get filter 'out'")
+                //     .sink()
+                //     .frame(&mut frame)?;
+                // log::info!("[filtered frame] pts: {:?}", frame.pts());
             }
         }
-
-        // let pts = if start == 0 {
-        //     start = ffmpeg::util::time::current();
-        //     0
-        // } else {
-        //     ffmpeg::util::time::current() - start
-        // };
-        //
-        // frame.set_pts(Some(pts));
-        // fill_frame(&yuv, &mut frame);
-        // graph
-        //     .get("in")
-        //     .expect("Cannot get filter 'in'")
-        //     .source()
-        //     .add(&frame)?;
-        // graph
-        //     .get("out")
-        //     .expect("Cannot get filter 'out'")
-        //     .sink()
-        //     .frame(&mut frame)?;
-        // log::info!("[filtered frame] pts: {:?}", frame.pts());
     }
 
     Ok(())

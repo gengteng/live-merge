@@ -96,16 +96,49 @@ pub async fn init(
         )
         .await?;
 
+    let offer = peer_connection.create_offer(None).await?;
+    peer_connection.set_local_description(offer.clone()).await?;
+    log::info!("local description:\n {}", offer.sdp);
+
+    let client = ApiClient::new(&host, port);
+    let param = PlayParam {
+        api: client.api_url(),
+        client_ip: None,
+        sdp: offer.sdp,
+        stream_url: format!("webrtc://{}/live/{}", host, tid),
+        tid,
+    };
+    let play = client.play(&param).await?;
+    log::info!("remote description:\n {}", play.sdp);
+
+    const PROFILE_PREFIX: &'static str = "profile-level-id=";
+    let profile_level_id = match play.sdp.find(PROFILE_PREFIX) {
+        None => anyhow::bail!("Failed to get profile-level-id"),
+        Some(index) => {
+            let start = index + PROFILE_PREFIX.len();
+            &play.sdp[start..start + 6]
+        }
+    };
+
+    let profile_indication = u8::from_str_radix(&profile_level_id[..2], 16)?;
+    let level_indication = u8::from_str_radix(&profile_level_id[4..], 16)?;
+
+    let record = AVCDecoderConfigurationRecord::new(profile_indication, level_indication);
+
+    log::info!("AVCDecoderConfigurationRecord: {:0x?}", record);
+
     let pc = Arc::downgrade(&peer_connection);
     peer_connection
         .on_track(Box::new(
             move |track: Option<Arc<TrackRemote>>, receiver: Option<Arc<RTCRtpReceiver>>| {
                 let s = sender.clone();
                 let pc = pc.clone();
+                let r = record.clone();
                 Box::pin(async move {
                     if let Some(track) = track {
                         let s = s.clone();
                         let pc = pc.clone();
+                        let r = r.clone();
                         tokio::spawn(async move {
                             let codec = track.codec().await;
                             let mime_type = codec.capability.mime_type;
@@ -156,37 +189,99 @@ pub async fn init(
                                             continue;
                                         }
 
-                                        log::info!("Got a key frame!");
-                                    }
+                                        let config = match rtp_decoder.depacketize(&packet.payload) {
+                                            Ok(bytes) => bytes,
+                                            Err(e) => {
+                                                log::error!("depacketize first key frame error: {}", e);
+                                                break;
+                                            }
+                                        };
 
-                                    // RTP payload format for h264: https://datatracker.ietf.org/doc/html/rfc6184#page-12
-                                    log::info!(
-                                        "RTP payload({}B): {:02x?}",
-                                        packet.payload.len(),
-                                        packet.payload.as_ref()
-                                    );
-                                    match rtp_decoder.depacketize(&packet.payload) {
-                                        Ok(h264_pkt) => {
-                                            if !h264_pkt.is_empty() {
-                                                let timestamp =
-                                                    packet.header.timestamp / clock_rate;
-                                                if s.send(H264Data::new(timestamp, h264_pkt))
-                                                    .await
-                                                    .is_err()
-                                                {
+                                        // 第一帧
+                                        // NAL Header: 0x78 = 0b01111000
+                                        // F|NRI|Type
+                                        // 0|11 |11000 = 24 => STAP-A
+                                        // first RTP payload(23B, hex):
+                                        // [78, 00, 0e, 67, 42, c0, 15, 8c, 8d, 40, a0, f9, 00, f0, 88, 46, a0, 00, 04, 68, ce, 3c, 80]
+                                        // |HDR|length|UHDR|                       data                        |length| HDR|   data   |
+                                        //        14
+                                        // Nal unit header: 0x67 = 0b01100111
+                                        // F|NRI|Type
+                                        // 0|11 |00111 = 7 => sequence parameter sets
+                                        //
+                                        // https://blog.csdn.net/lu_embedded/article/details/69666414
+                                        if let [0x78, body @ ..] = packet.payload.as_ref() {
+                                            log::info!("Got a key frame payload in STAP-A format: {:02x?}", body);
+                                            let mut rest = body;
+                                            let mut record = r.clone();
+                                            while let [len0, len1, body @ ..] = rest {
+                                                let len =
+                                                    u16::from_be_bytes([*len0, *len1]);
+                                                if len as usize > body.len() {
                                                     log::error!(
-                                                        "Failed to send h264 packet to ffmpeg"
+                                                        "Insufficient nal unit data, len={}, data length={}",
+                                                        len,
+                                                        body.len()
                                                     );
                                                     break;
                                                 }
+
+                                                rest = &body[len as usize..];
+
+                                                let data = Vec::from(&body[..len as usize]);
+                                                match body {
+                                                    [0x67, ..] => record.add_sps(data),
+                                                    [0x68, ..] => record.add_pps(data),
+                                                    _ => continue,
+                                                }
                                             }
+
+                                            if s.send(H264Data::configuration(config, record))
+                                                .await
+                                                .is_err()
+                                            {
+                                                log::error!(
+                                                        "Failed to send h264 configuration to ffmpeg"
+                                                    );
+                                                break;
+                                            }
+
+                                        } else {
+                                            log::error!("First key frame is not a STAP-A packet.");
+                                            break;
                                         }
-                                        Err(e) => {
-                                            log::error!(
+                                    } else {
+                                        // 0x7c == 0b01111100, Type = 28, FU-A
+                                        // RTP payload format for h264: https://datatracker.ietf.org/doc/html/rfc6184#page-12
+                                        log::info!(
+                                            "RTP payload({}B): {:02x?}",
+                                            packet.payload.len(),
+                                            packet.payload.as_ref()
+                                        );
+
+                                        match rtp_decoder.depacketize(&packet.payload) {
+                                            Ok(h264_pkt) => {
+                                                if !h264_pkt.is_empty() {
+                                                    let timestamp =
+                                                        packet.header.timestamp / clock_rate;
+                                                    if s.send(H264Data::data(timestamp, h264_pkt))
+                                                        .await
+                                                        .is_err()
+                                                    {
+                                                        log::error!(
+                                                        "Failed to send h264 packet to ffmpeg"
+                                                    );
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                log::error!(
                                                 "Failed to depacketize rtp packet to h264: {}",
                                                 e
                                             );
-                                            break;
+                                                break;
+                                            }
                                         }
                                     }
                                 }
@@ -253,37 +348,6 @@ pub async fn init(
             })
         }))
         .await;
-
-    let offer = peer_connection.create_offer(None).await?;
-    peer_connection.set_local_description(offer.clone()).await?;
-    log::info!("local description:\n {}", offer.sdp);
-
-    let client = ApiClient::new(&host, port);
-    let param = PlayParam {
-        api: client.api_url(),
-        client_ip: None,
-        sdp: offer.sdp,
-        stream_url: format!("webrtc://{}/live/{}", host, tid),
-        tid,
-    };
-    let play = client.play(&param).await?;
-    log::info!("remote description:\n {}", play.sdp);
-
-    const PROFILE_PREFIX: &'static str = "profile-level-id=";
-    let profile_level_id = match play.sdp.find(PROFILE_PREFIX) {
-        None => anyhow::bail!("Failed to get profile-level-id"),
-        Some(index) => {
-            let start = index + PROFILE_PREFIX.len();
-            &play.sdp[start..start + 6]
-        }
-    };
-
-    let profile_indication = u8::from_str_radix(&profile_level_id[..2], 16)?;
-    let level_indication = u8::from_str_radix(&profile_level_id[4..], 16)?;
-
-    let record = AVCDecoderConfigurationRecord::new(profile_indication, level_indication);
-
-    log::info!("AVCDecoderConfigurationRecord: {:0x?}", record);
 
     let mut answer = RTCSessionDescription::default();
     answer.sdp_type = RTCSdpType::Answer;

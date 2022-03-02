@@ -80,7 +80,7 @@ impl RtmpConnection {
                     result = socket.read(&mut buffer) => {
                         let bytes = result?;
                         if bytes == 0 {
-                            log::error!("read 0 bytes");
+                            log::error!("connection closed");
                             break;
                         }
 
@@ -104,19 +104,24 @@ impl RtmpConnection {
                                             // RtmpConnection::send_outbound_packet(&mut socket, session.publish_video_data(Bytes::new(), RtmpTimestamp::new(0), true)?).await?;
                                             // RtmpConnection::send_outbound_packet(&mut socket, session.publish_audio_data(Bytes::new(), RtmpTimestamp::new(0), true)?).await?;
                                             let mut timestamp = RtmpTimestamp::new(0);
-                                            let mut rtp_ts = None;
+                                            let mut rtp_ts: Option<u32> = None;
                                             while let Some(h264) = h264_reader.recv().await {
-                                                match rtp_ts {
-                                                    Some(ts) => {
-                                                        let offset = h264.timestamp() - ts;
-                                                        timestamp = timestamp + offset;
-                                                        rtp_ts = Some(ts + offset);
-                                                    }
-                                                    None => {
-                                                        rtp_ts = Some(h264.timestamp());
+                                                if let H264Data::Data { timestamp: h264_ts, .. } = &h264 {
+                                                    match rtp_ts {
+                                                        Some(ts) => {
+                                                            let offset = *h264_ts - ts;
+                                                            timestamp = timestamp + offset;
+                                                            rtp_ts = Some(ts + offset);
+                                                        }
+                                                        None => {
+                                                            rtp_ts = Some(*h264_ts);
+                                                        }
                                                     }
                                                 }
-                                                RtmpConnection::send_outbound_packet(&mut socket, session.publish_video_data(h264.into(), timestamp, true)?).await?;
+                                                let data_to_send: bytes::Bytes = h264.into();
+                                                log::info!("RTMP body: {:02x?}", data_to_send.as_ref());
+                                                // https://blog.csdn.net/jctian000/article/details/93205093
+                                                RtmpConnection::send_outbound_packet(&mut socket, session.publish_video_data(data_to_send, timestamp, true)?).await?;
                                             }
                                         }
                                         e => log::info!("event: {:?}", e),
